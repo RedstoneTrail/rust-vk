@@ -1,0 +1,11 @@
+[package]
+name = "rust-vk"
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev]
+opt-level = 1
+
+[dependencies]
+vulkano = "0.34.0"
+vulkano-shaders = { version="0.34.0", features = [ "shaderc-build-from-source" ] }
