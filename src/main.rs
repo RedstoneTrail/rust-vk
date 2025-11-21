@@ -1,22 +1,29 @@
 use std::sync::Arc;
 
-use vulkano::VulkanLibrary;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::{
     StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
 };
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
+use vulkano::command_buffer::{
+    AutoCommandBufferBuilder, ClearColorImageInfo, CommandBufferUsage, CopyImageToBufferInfo,
+};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet, layout};
 use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo, QueueFlags};
+use vulkano::format::{ClearColorValue, Format};
+use vulkano::image::view::ImageView;
+use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
+use vulkano::pipeline::compute::{self, ComputePipelineCreateInfo};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
     ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
 };
 use vulkano::sync::{self, GpuFuture};
+use vulkano::{VulkanLibrary, command_buffer};
+
+use image::{ImageBuffer, Rgba};
 
 fn main() {
     let library = VulkanLibrary::new().expect("no local Vulkan library/DLL");
@@ -75,44 +82,38 @@ fn main() {
 
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
-    let data_count = 65536u32;
-    let data_iter = 0..data_count;
-    let data_buffer = Buffer::from_iter(
+    let image_dims = [8192, 8192];
+
+    let image = Image::new(
         memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: Format::R8G8B8A8_UNORM,
+            extent: [image_dims[0], image_dims[1], 1],
+            usage: ImageUsage::STORAGE | ImageUsage::TRANSFER_SRC,
             ..Default::default()
         },
         AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
         },
-        data_iter,
     )
-    .expect("failed to create buffer");
+    .expect("image creation failed");
+
+    println!("image created");
+
+    let view = ImageView::new_default(image.clone()).unwrap();
+
+    println!("image view created");
 
     mod cs {
         vulkano_shaders::shader! {
             ty: "compute",
-            src: "
-                #version 460
-
-                layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-
-                layout(set = 0, binding = 0) buffer Data {
-                    uint data[];
-                } buf;
-
-                void main() {
-                    uint idx = gl_GlobalInvocationID.x;
-                    buf.data[idx] *= buf.data[idx];
-                }
-            "
+            path: "src/shader.glsl",
         }
     }
 
-    let shader = cs::load(device.clone()).expect("failed to load shader");
+    let shader = cs::load(device.clone()).expect("shader module creation failed");
 
     let cs = shader.entry_point("main").unwrap();
     let stage = PipelineShaderStageCreateInfo::new(cs);
@@ -129,53 +130,70 @@ fn main() {
         None,
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
-    .expect("failed to create compute pipeline");
+    .expect("compute pipeline creation failed");
 
     let descriptor_set_allocator =
         StandardDescriptorSetAllocator::new(device.clone(), Default::default());
-    let pipeline_layout = compute_pipeline.layout();
-    let descriptor_set_layouts = pipeline_layout.set_layouts();
 
-    let descriptor_set_layout_index = 0;
-    let descriptor_set_layout = descriptor_set_layouts
-        .get(descriptor_set_layout_index)
-        .unwrap();
+    let pipeline_layout = compute_pipeline.layout().set_layouts().get(0).unwrap();
     let descriptor_set = PersistentDescriptorSet::new(
         &descriptor_set_allocator,
-        descriptor_set_layout.clone(),
-        [WriteDescriptorSet::buffer(0, data_buffer.clone())], // 0 is the binding number referenced in the shader
+        pipeline_layout.clone(),
+        [WriteDescriptorSet::image_view(0, view.clone())], // bound at 0
         [],
     )
     .unwrap();
+
+    println!("compute pipeline ready");
+
+    let dst = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            ..Default::default()
+        },
+        (0..image_dims[0] * image_dims[1] * 4).map(|_| 0u8),
+    )
+    .expect("destination buffer creation failed");
+
+    println!("destination buffer created");
 
     let command_buffer_allocator = StandardCommandBufferAllocator::new(
         device.clone(),
         StandardCommandBufferAllocatorCreateInfo::default(),
     );
 
-    let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
+    let mut builder = AutoCommandBufferBuilder::primary(
         &command_buffer_allocator,
         queue.queue_family_index(),
         CommandBufferUsage::OneTimeSubmit,
     )
     .unwrap();
 
-    let work_group_counts = [data_count / 64 + 1, 1, 1];
-
-    command_buffer_builder
+    builder
         .bind_pipeline_compute(compute_pipeline.clone())
         .unwrap()
         .bind_descriptor_sets(
             PipelineBindPoint::Compute,
             compute_pipeline.layout().clone(),
-            descriptor_set_layout_index as u32,
+            0,
             descriptor_set,
         )
         .unwrap()
-        .dispatch(work_group_counts)
+        .dispatch([image_dims[0] / 8, image_dims[1] / 8, 1])
+        .unwrap()
+        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+            image.clone(),
+            dst.clone(),
+        ))
         .unwrap();
 
-    let command_buffer = command_buffer_builder.build().unwrap();
+    let command_buffer = builder.build().unwrap();
 
     let future = sync::now(device.clone())
         .then_execute(queue.clone(), command_buffer)
@@ -183,14 +201,17 @@ fn main() {
         .then_signal_fence_and_flush()
         .unwrap();
 
+    println!("command buffer sent and begun");
+
     future.wait(None).unwrap();
 
-    let content = data_buffer.read().unwrap();
-    println!("values generated are as follows: (input, output)");
-    for (n, val) in content.iter().enumerate() {
-        // assert_eq!(*val, n as u32 * 12);
-        println!("\t{:?}, {:?}", n, val,);
-    }
+    println!("command buffer execution finished");
 
-    println!("big multiplication successful!");
+    let dst_content = dst.read().unwrap();
+    let out = ImageBuffer::<Rgba<u8>, _>::from_raw(image_dims[0], image_dims[1], &dst_content[..])
+        .unwrap();
+
+    out.save("image.png").unwrap();
+
+    println!("ouput saved as image.png");
 }
