@@ -23,6 +23,19 @@
             combine [
               stable.toolchain
             ];
+          packageList = [
+            pkgs.cmake
+            pkgs.pkg-config
+            pkgs.shaderc
+            pkgs.spirv-tools
+            pkgs.vulkan-loader
+            pkgs.vulkan-tools
+            pkgs.vulkan-tools-lunarg
+            pkgs.vulkan-validation-layers
+            pkgs.wayland
+            pkgs.libxkbcommon
+            rust.rust-analyzer
+          ];
         in
         {
           _module.args.pkgs = import inputs.nixpkgs {
@@ -32,26 +45,9 @@
           devShells.default = pkgs.mkShell {
             nativeBuildInputs = [ toolchain ];
 
-            packages = [
-              pkgs.cmake
-              pkgs.pkg-config
-              pkgs.shaderc
-              pkgs.spirv-tools
-              pkgs.vulkan-loader
-              pkgs.vulkan-tools
-              pkgs.vulkan-tools-lunarg
-              pkgs.vulkan-validation-layers
-              rust.rust-analyzer
-            ];
+            packages = packageList;
 
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-              pkgs.shaderc
-              pkgs.spirv-tools
-              pkgs.vulkan-loader
-              pkgs.vulkan-tools
-              pkgs.vulkan-tools-lunarg
-              pkgs.vulkan-validation-layers
-            ];
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath packageList;
             SHADERC_LIB_DIR = pkgs.lib.makeLibraryPath [ pkgs.shaderc ];
             VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
           };
