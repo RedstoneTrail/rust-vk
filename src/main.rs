@@ -12,9 +12,8 @@ use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
 };
-use vulkano::format::Format;
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
+use vulkano::image::{Image, ImageUsage};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
@@ -25,7 +24,9 @@ use vulkano::pipeline::graphics::rasterization::RasterizationState;
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::pipeline::{
+    GraphicsPipeline, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
 use vulkano::shader::ShaderModule;
 use vulkano::swapchain;
@@ -34,16 +35,23 @@ use vulkano::sync::future::FenceSignalFuture;
 use vulkano::sync::{self, GpuFuture};
 use vulkano::{Validated, VulkanError, VulkanLibrary};
 
-use winit::event::{Event, WindowEvent};
+use winit::event::{DeviceEvent, Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
 
-#[derive(BufferContents, Vertex)]
+#[derive(BufferContents, Vertex, Clone, Copy)]
 #[repr(C)]
 struct Point {
     #[format(R32G32_SFLOAT)]
     position: [f32; 2],
 }
+
+// #[derive(BufferContents, Clone, Copy)]
+// #[repr(C)]
+// struct PushConstants {
+//     resolution: [u32; 2],
+//     rotation: f32,
+// }
 
 mod vs {
     vulkano_shaders::shader! {
@@ -118,6 +126,7 @@ fn get_command_buffers(
     pipeline: &Arc<GraphicsPipeline>,
     framebuffers: &Vec<Arc<Framebuffer>>,
     vertex_buffer: &Subbuffer<[Point]>,
+    push_constants: vs::PushConstants,
 ) -> Vec<Arc<PrimaryAutoCommandBuffer>> {
     framebuffers
         .iter()
@@ -142,6 +151,8 @@ fn get_command_buffers(
                 )
                 .unwrap()
                 .bind_pipeline_graphics(pipeline.clone())
+                .unwrap()
+                .push_constants(pipeline.layout().clone(), 0, push_constants)
                 .unwrap()
                 .bind_vertex_buffers(0, vertex_buffer.clone())
                 .unwrap()
@@ -255,8 +266,7 @@ fn main() {
         ..DeviceExtensions::empty()
     };
 
-    let (physical_device, queue_family_index) =
-        select_physical_device(&instance, &surface, &device_extensions);
+    let (physical_device, _) = select_physical_device(&instance, &surface, &device_extensions);
 
     println!("device made");
 
@@ -329,7 +339,7 @@ fn main() {
 
     let render_pass = get_render_pass(device.clone(), &swapchain);
 
-    let framebuffers = get_framebuffers(&images, render_pass.clone());
+    let mut framebuffers = get_framebuffers(&images, render_pass.clone());
 
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
@@ -337,10 +347,13 @@ fn main() {
         position: [-0.5, -0.5],
     };
     let vert2 = Point {
-        position: [0.0, 0.5],
+        position: [0.5, -0.5],
     };
     let vert3 = Point {
-        position: [0.5, -0.25],
+        position: [0.5, 0.5],
+    };
+    let vert4 = Point {
+        position: [-0.5, 0.5],
     };
 
     let vertex_buffer = Buffer::from_iter(
@@ -354,9 +367,14 @@ fn main() {
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
-        vec![vert1, vert2, vert3],
+        vec![vert1, vert2, vert3, vert1, vert3, vert4],
     )
     .unwrap();
+
+    let mut push_constants = vs::PushConstants {
+        rotation: Into::into(0.0),
+        resolution: window.inner_size().into(),
+    };
 
     let vs = vs::load(device.clone()).expect("vertex shader module creation failed");
     let fs = fs::load(device.clone()).expect("fragment shader module creation failed");
@@ -384,8 +402,9 @@ fn main() {
         &command_buffer_allocator,
         &queue,
         &pipeline,
-        &framebuffers,
+        &framebuffers.clone(),
         &vertex_buffer,
+        push_constants.clone(),
     );
 
     let frames_in_flight = images.len();
@@ -426,6 +445,9 @@ fn main() {
 
                 if window_resized {
                     window_resized = false;
+                    println!(
+                        "window was resized, resizing viewport and rebuilding command buffers"
+                    );
 
                     viewport.extent = new_dimensions.into();
 
@@ -441,10 +463,40 @@ fn main() {
                         &command_buffer_allocator,
                         &queue,
                         &new_pipeline,
-                        &new_framebuffers,
+                        &new_framebuffers.clone(),
                         &vertex_buffer,
+                        push_constants.clone(),
                     );
+
+                    framebuffers = new_framebuffers;
                 }
+            } else {
+                let new_dimensions = window.inner_size();
+                viewport.extent = new_dimensions.into();
+                push_constants.resolution = new_dimensions.into();
+
+                let new_pipeline = get_pipeline(
+                    device.clone(),
+                    vs.clone(),
+                    fs.clone(),
+                    render_pass.clone(),
+                    viewport.clone(),
+                );
+
+                command_buffers = get_command_buffers(
+                    &command_buffer_allocator,
+                    &queue,
+                    &new_pipeline,
+                    &framebuffers.clone(),
+                    &vertex_buffer,
+                    push_constants.clone(),
+                );
+            }
+
+            *push_constants.rotation += <f32 as Into<f32>>::into(0.01);
+
+            if push_constants.rotation >= Into::into(1.0) {
+                push_constants.rotation = Into::into(0.0);
             }
 
             let (image_i, suboptimal, acquire_future) =
