@@ -1,3 +1,4 @@
+use std::cmp::min;
 use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -5,15 +6,18 @@ use vulkano::command_buffer::allocator::{
     StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
 };
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo,
-    SubpassBeginInfo, SubpassContents, SubpassEndInfo,
+    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, PrimaryAutoCommandBuffer,
+    RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
 };
+use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
+use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
 };
+use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageUsage};
+use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
@@ -35,35 +39,34 @@ use vulkano::sync::future::FenceSignalFuture;
 use vulkano::sync::{self, GpuFuture};
 use vulkano::{Validated, VulkanError, VulkanLibrary};
 
-use winit::event::{DeviceEvent, Event, WindowEvent};
+use winit::event::{DeviceEvent, Event, VirtualKeyCode, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
 
-#[derive(BufferContents, Vertex, Clone, Copy)]
+#[derive(BufferContents, Vertex, Clone, Copy, Default)]
 #[repr(C)]
 struct Point {
+    #[format(R32G32B32_SFLOAT)]
+    position: [f32; 3],
     #[format(R32G32_SFLOAT)]
-    position: [f32; 2],
+    uv: [f32; 2],
+    #[format(R32G32B32_SFLOAT)]
+    normal: [f32; 3],
+    #[format(R32G32B32_SFLOAT)]
+    color: [f32; 3],
 }
-
-// #[derive(BufferContents, Clone, Copy)]
-// #[repr(C)]
-// struct PushConstants {
-//     resolution: [u32; 2],
-//     rotation: f32,
-// }
 
 mod vs {
     vulkano_shaders::shader! {
         ty: "vertex",
-        path: "src/vertex.glsl",
+        path: "src/vertex.vert",
     }
 }
 
 mod fs {
     vulkano_shaders::shader! {
         ty: "fragment",
-        path: "src/fragment.glsl",
+        path: "src/fragment.frag",
     }
 }
 
@@ -122,12 +125,38 @@ fn get_pipeline(
 
 fn get_command_buffers(
     command_buffer_allocator: &StandardCommandBufferAllocator,
+    device: Arc<Device>,
     queue: &Arc<Queue>,
     pipeline: &Arc<GraphicsPipeline>,
     framebuffers: &Vec<Arc<Framebuffer>>,
-    vertex_buffer: &Subbuffer<[Point]>,
+    vertex_buffer: Subbuffer<[Point]>,
+    index_buffer: &Subbuffer<[u32]>,
     push_constants: vs::PushConstants,
+    sampler: &Arc<Sampler>,
+    texture: &Arc<ImageView>,
+    frame_idx: u32,
 ) -> Vec<Arc<PrimaryAutoCommandBuffer>> {
+    let descriptor_set_allocator =
+        StandardDescriptorSetAllocator::new(device.clone(), Default::default());
+
+    let layouts = pipeline.layout().set_layouts();
+    println!("\tlisting {:?} descriptor set layouts", layouts.len());
+    for layout in layouts.into_iter() {
+        dbg!(layout);
+    }
+    let layout = layouts.get(frame_idx as usize).unwrap();
+    let set = PersistentDescriptorSet::new(
+        &descriptor_set_allocator,
+        layout.clone(),
+        [WriteDescriptorSet::image_view_sampler(
+            0,
+            texture.clone(),
+            sampler.clone(),
+        )],
+        [],
+    )
+    .unwrap();
+
     framebuffers
         .iter()
         .map(|framebuffer| {
@@ -156,7 +185,16 @@ fn get_command_buffers(
                 .unwrap()
                 .bind_vertex_buffers(0, vertex_buffer.clone())
                 .unwrap()
-                .draw(vertex_buffer.len() as u32, 1, 0, 0)
+                .bind_index_buffer(index_buffer.clone())
+                .unwrap()
+                .bind_descriptor_sets(
+                    vulkano::pipeline::PipelineBindPoint::Graphics,
+                    pipeline.layout().clone(),
+                    0,
+                    set.clone(),
+                )
+                .unwrap()
+                .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
                 .unwrap()
                 .end_render_pass(SubpassEndInfo::default())
                 .unwrap();
@@ -339,22 +377,56 @@ fn main() {
 
     let render_pass = get_render_pass(device.clone(), &swapchain);
 
+    println!("render pass created");
+
     let mut framebuffers = get_framebuffers(&images, render_pass.clone());
+
+    println!("framebuffers created");
 
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
-    let vert1 = Point {
-        position: [-0.5, -0.5],
-    };
-    let vert2 = Point {
-        position: [0.5, -0.5],
-    };
-    let vert3 = Point {
-        position: [0.5, 0.5],
-    };
-    let vert4 = Point {
-        position: [-0.5, 0.5],
-    };
+    let verts = [
+        Point {
+            position: [0.5, 0.5, 0.5],
+            uv: [1.0, 1.0],
+            ..Default::default()
+        },
+        Point {
+            position: [-0.5, 0.5, 0.5],
+            uv: [-1.0, 1.0],
+            ..Default::default()
+        },
+        Point {
+            position: [0.5, -0.5, 0.5],
+            uv: [1.0, -1.0],
+            ..Default::default()
+        },
+        Point {
+            position: [-0.5, -0.5, 0.5],
+            uv: [-1.0, -1.0],
+            ..Default::default()
+        },
+        Point {
+            position: [0.5, 0.5, -0.5],
+            uv: [1.0, 1.0],
+            ..Default::default()
+        },
+        Point {
+            position: [-0.5, 0.5, -0.5],
+            uv: [-1.0, 1.0],
+            ..Default::default()
+        },
+        Point {
+            position: [0.5, -0.5, -0.5],
+            uv: [1.0, -1.0],
+            ..Default::default()
+        },
+        Point {
+            position: [-0.5, -0.5, -0.5],
+            uv: [-1.0, -1.0],
+            ..Default::default()
+        },
+    ];
 
     let vertex_buffer = Buffer::from_iter(
         memory_allocator.clone(),
@@ -367,21 +439,29 @@ fn main() {
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
-        vec![vert1, vert2, vert3, vert1, vert3, vert4],
+        verts.into_iter(),
     )
     .unwrap();
 
+    println!("vertex buffer created");
+
+    let mut res = min(window.inner_size().height, window.inner_size().width) as f32;
+
     let mut push_constants = vs::PushConstants {
-        rotation: Into::into(0.0),
+        origin: [0.0, 0.0, 0.3].into(),
+        rotation: [0.0, 0.0].into(),
         resolution: window.inner_size().into(),
+        side_length: res,
     };
 
     let vs = vs::load(device.clone()).expect("vertex shader module creation failed");
     let fs = fs::load(device.clone()).expect("fragment shader module creation failed");
 
+    println!("shaders loaded");
+
     let mut viewport = Viewport {
         offset: [0.0, 0.0],
-        extent: window.inner_size().into(),
+        extent: [res, res],
         depth_range: 0.0..=1.0,
     };
 
@@ -393,19 +473,146 @@ fn main() {
         viewport.clone(),
     );
 
+    println!("pipeline created");
+
     let command_buffer_allocator = StandardCommandBufferAllocator::new(
         device.clone(),
         StandardCommandBufferAllocatorCreateInfo::default(),
     );
 
+    let index_buffer = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::INDEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        [0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5].into_iter(),
+    )
+    .unwrap();
+
+    println!("index buffer created");
+
+    let texture = image::load_from_memory(include_bytes!("../texture.png")).unwrap();
+
+    println!(
+        "loaded image dimensions: {:?}x{:?}",
+        texture.width(),
+        texture.height()
+    );
+
+    let image: Arc<Image>;
+
+    let texture = {
+        let mut uploads = AutoCommandBufferBuilder::primary(
+            &command_buffer_allocator,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        let staging_buffer = Buffer::new_slice(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            (texture.width() * texture.height() * 3) as u64,
+        )
+        .unwrap();
+
+        let image_data = &mut *staging_buffer.write().unwrap();
+
+        let bytes = texture.as_bytes();
+
+        println!(
+            "texture.as_bytes().len() = {:?}\ntexture.width() * texture.height() * 3 = {:?}",
+            texture.as_bytes().len(),
+            texture.width() * texture.height() * 3
+        );
+
+        for i in 0..bytes.len() - 1 {
+            image_data[i] = bytes[i].clone();
+        }
+
+        image = Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: vulkano::format::Format::R8G8B8_SRGB,
+                extent: [texture.width(), texture.height(), 1],
+                usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                sharing: sync::Sharing::Exclusive,
+                tiling: vulkano::image::ImageTiling::Optimal,
+                samples: vulkano::image::SampleCount::Sample1,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        uploads
+            .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
+                staging_buffer.clone(),
+                image.clone(),
+            ))
+            .unwrap();
+
+        dbg!();
+
+        let image = Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: vulkano::format::Format::R8G8B8_SRGB,
+                extent: [texture.width(), texture.height(), 1],
+                usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                sharing: sync::Sharing::Exclusive,
+                tiling: vulkano::image::ImageTiling::Optimal,
+                samples: vulkano::image::SampleCount::Sample1,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        ImageView::new_default(image).unwrap()
+    };
+
+    let sampler = Sampler::new(device.clone(), SamplerCreateInfo::simple_repeat_linear()).unwrap();
+
+    println!("texture created");
+
     let mut command_buffers = get_command_buffers(
         &command_buffer_allocator,
+        device.clone(),
         &queue,
         &pipeline,
         &framebuffers.clone(),
-        &vertex_buffer,
+        vertex_buffer.clone(),
+        &index_buffer,
         push_constants.clone(),
+        &sampler,
+        &texture,
+        0,
     );
+
+    println!("initial command buffers created");
 
     let frames_in_flight = images.len();
     let mut fences: Vec<Option<Arc<FenceSignalFuture<_>>>> = vec![None; frames_in_flight];
@@ -413,25 +620,87 @@ fn main() {
 
     let mut window_resized = false;
     let mut recreate_swapchain = false;
+    let mut frame_idx: u32 = 0;
 
     event_loop.run(move |event, _, control_flow| match event {
-        Event::WindowEvent {
-            event: WindowEvent::CloseRequested,
-            ..
-        } => {
-            *control_flow = ControlFlow::Exit;
-        }
-        Event::WindowEvent {
-            event: WindowEvent::Resized(_),
-            ..
-        } => {
-            window_resized = true;
+        Event::WindowEvent { event: ev, .. } => match ev {
+            WindowEvent::CloseRequested => {
+                println!("window close requested");
+                *control_flow = ControlFlow::Exit;
+            }
+            WindowEvent::Resized(_) => {
+                window_resized = true;
+                println!("window resized to {:?}", window.inner_size());
+            }
+            WindowEvent::KeyboardInput { input, .. } => {
+                // only quit on release of Q (no auto repeat)
+                if input.virtual_keycode.is_some() {
+                    if input.state == winit::event::ElementState::Released
+                        && input.virtual_keycode.unwrap() == VirtualKeyCode::Q
+                    {
+                        println!("Q was pressed, quitting");
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
+
+                // only accept input when it is pressed (gives auto repeat)
+                if input.virtual_keycode.is_some()
+                    && input.state == winit::event::ElementState::Pressed
+                {
+                    match input.virtual_keycode.unwrap() {
+                        VirtualKeyCode::K => {
+                            println!("K was pressed, moving away");
+
+                            push_constants.origin[2] -= <f32 as Into<f32>>::into(0.1);
+                        }
+                        VirtualKeyCode::J => {
+                            println!("J was pressed, moving toward");
+
+                            push_constants.origin[2] += <f32 as Into<f32>>::into(0.1);
+                        }
+                        VirtualKeyCode::H => {
+                            println!("H was pressed, moving left");
+
+                            push_constants.origin[0] -= <f32 as Into<f32>>::into(0.1);
+                        }
+                        VirtualKeyCode::L => {
+                            println!("L was pressed, moving right");
+
+                            push_constants.origin[0] += <f32 as Into<f32>>::into(0.1);
+                        }
+                        _ => {
+                            // println!("key pressed");
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
+        Event::DeviceEvent { event: ev, .. } => match ev {
+            DeviceEvent::MouseMotion { delta } => {
+                // println!("mouse moved by {:?}", delta);
+
+                push_constants.rotation[0] +=
+                    <f32 as Into<f32>>::into(delta.0 as f32 / push_constants.resolution[0]);
+                push_constants.rotation[1] +=
+                    <f32 as Into<f32>>::into(delta.1 as f32 / push_constants.resolution[1]);
+
+                // println!("rotation is now {:?}", push_constants.rotation);
+            }
+            _ => {
+                // println!("device event recieved: ev={:?} from id={:?}", ev, id);
+            }
+        },
+        Event::UserEvent(_) => {
+            println!("user event recieved");
         }
         Event::MainEventsCleared => {
             if window_resized || recreate_swapchain {
                 recreate_swapchain = false;
 
                 let new_dimensions = window.inner_size();
+
+                res = min(new_dimensions.width, new_dimensions.height) as f32;
 
                 let (new_swapchain, new_images) = swapchain
                     .recreate(SwapchainCreateInfo {
@@ -445,11 +714,8 @@ fn main() {
 
                 if window_resized {
                     window_resized = false;
-                    println!(
-                        "window was resized, resizing viewport and rebuilding command buffers"
-                    );
 
-                    viewport.extent = new_dimensions.into();
+                    viewport.extent = [res, res];
 
                     let new_pipeline = get_pipeline(
                         device.clone(),
@@ -461,11 +727,16 @@ fn main() {
 
                     command_buffers = get_command_buffers(
                         &command_buffer_allocator,
+                        device.clone(),
                         &queue,
                         &new_pipeline,
                         &new_framebuffers.clone(),
-                        &vertex_buffer,
+                        vertex_buffer.clone(),
+                        &index_buffer,
                         push_constants.clone(),
+                        &sampler,
+                        &texture,
+                        frame_idx,
                     );
 
                     framebuffers = new_framebuffers;
@@ -474,6 +745,7 @@ fn main() {
                 let new_dimensions = window.inner_size();
                 viewport.extent = new_dimensions.into();
                 push_constants.resolution = new_dimensions.into();
+                push_constants.side_length = res;
 
                 let new_pipeline = get_pipeline(
                     device.clone(),
@@ -483,20 +755,21 @@ fn main() {
                     viewport.clone(),
                 );
 
+                frame_idx += 1;
+
                 command_buffers = get_command_buffers(
                     &command_buffer_allocator,
+                    device.clone(),
                     &queue,
                     &new_pipeline,
                     &framebuffers.clone(),
-                    &vertex_buffer,
+                    vertex_buffer.clone(),
+                    &index_buffer,
                     push_constants.clone(),
+                    &sampler,
+                    &texture,
+                    frame_idx,
                 );
-            }
-
-            *push_constants.rotation += <f32 as Into<f32>>::into(0.01);
-
-            if push_constants.rotation >= Into::into(1.0) {
-                push_constants.rotation = Into::into(0.0);
             }
 
             let (image_i, suboptimal, acquire_future) =
@@ -518,7 +791,9 @@ fn main() {
 
             // wait until the fence for this image is finished
             if let Some(image_fence) = &fences[image_i as usize] {
-                image_fence.wait(None).unwrap();
+                image_fence
+                    .wait(None)
+                    .expect("failed to wait for next image");
             }
 
             // create a previous future if it doesnt already exist
@@ -536,22 +811,30 @@ fn main() {
             let future = previous_future
                 .join(acquire_future)
                 .then_execute(queue.clone(), command_buffers[image_i as usize].clone())
-                .unwrap()
+                .expect("execution failed")
                 .then_swapchain_present(
                     queue.clone(),
                     SwapchainPresentInfo::swapchain_image_index(swapchain.clone(), image_i),
                 )
                 .then_signal_fence_and_flush();
 
-            fences[image_i as usize] = match future.map_err(Validated::unwrap) {
-                Ok(value) => Some(Arc::new(value)),
-                Err(VulkanError::OutOfDate) => {
-                    recreate_swapchain = true;
-                    None
-                }
+            match future {
                 Err(e) => {
-                    println!("future flush failed: {e}");
-                    None
+                    dbg!(&e);
+                    panic!("fence validation failed: {e}");
+                }
+                _ => {
+                    fences[image_i as usize] = match future.map_err(Validated::unwrap) {
+                        Ok(value) => Some(Arc::new(value)),
+                        Err(VulkanError::OutOfDate) => {
+                            recreate_swapchain = true;
+                            None
+                        }
+                        Err(e) => {
+                            println!("future flush failed: {e}");
+                            None
+                        }
+                    };
                 }
             };
 

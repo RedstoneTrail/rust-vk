@@ -25,6 +25,8 @@
             ];
           packageList = [
             pkgs.cmake
+            pkgs.glsl_analyzer
+            pkgs.libxkbcommon
             pkgs.pkg-config
             pkgs.shaderc
             pkgs.spirv-tools
@@ -33,7 +35,6 @@
             pkgs.vulkan-tools-lunarg
             pkgs.vulkan-validation-layers
             pkgs.wayland
-            pkgs.libxkbcommon
             rust.rust-analyzer
           ];
         in
@@ -43,7 +44,11 @@
           };
 
           devShells.default = pkgs.mkShell {
-            nativeBuildInputs = [ toolchain ];
+            nativeBuildInputs = [
+              toolchain
+              pkgs.clang
+              pkgs.mold
+            ];
 
             packages = packageList;
 
