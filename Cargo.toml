@@ -7,7 +7,7 @@ edition = "2024"
 opt-level = 1
 
 [dependencies]
-vulkano = "0.34.0"
-vulkano-shaders = { version="0.34.0", features = [ "shaderc-build-from-source" ] }
-image = "0.24"
-winit = "0.28.0"
+image = "0.25.9"
+vulkano = "0.35.2"
+vulkano-shaders = "0.35.0"
+winit = "0.30.12"
